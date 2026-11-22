@@ -1,0 +1,13 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "7d3c1a52-9b4e-4f6a-8e21-5c0b2f9a41d7",
+  "author": "",
+  "description": {
+    "": "Label faces, then copy their bodies into a 'Flatpack CNC' component laid flat on XY (Z=0) with a gap between parts."
+  },
+  "version": "1.0.0",
+  "runOnStartup": false,
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}
