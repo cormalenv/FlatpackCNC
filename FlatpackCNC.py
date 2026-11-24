@@ -1,7 +1,7 @@
-import adsk.core, adsk.fusion, traceback, math, os, random, time
+import adsk.core, adsk.fusion, traceback, math, os, random, time, json
 
 ATTR_GROUP = 'FlatpackCNC'
-ATTR_NAME = 'Selected'
+ATTR_ITEMS = 'PartList'          # JSON list of the parts, stored on the design
 COMP_NAME = 'Flatpack CNC'
 CMD_MAIN = 'flatpackMainCmd'
 CMD_LABEL = 'flatpackLabelCmd'
@@ -20,26 +20,6 @@ handlers = []          # keep handler references alive
 # ---------------------------------------------------------------- helpers
 def get_design():
     return adsk.fusion.Design.cast(app.activeProduct)
-
-
-def all_bodies(root):
-    """Root bodies plus bodies in every occurrence (as assembly-context proxies)."""
-    bodies = list(root.bRepBodies)
-    for occ in root.allOccurrences:
-        bodies.extend(occ.bRepBodies)
-    return bodies
-
-
-def labelled_faces(root):
-    """Return {body entityToken: (body, face)} for every labelled face."""
-    found = {}
-    for body in all_bodies(root):
-        if body.parentComponent.name == COMP_NAME:
-            continue
-        for face in body.faces:
-            if face.attributes.itemByName(ATTR_GROUP, ATTR_NAME):
-                found.setdefault(body.entityToken, (body, face))
-    return found
 
 
 def face_frame(face, align_edge=True):
@@ -82,145 +62,94 @@ def translation(dx, dy, dz):
     return m
 
 
-# ---------------------------------------------------------------- labels + colour
-# A face is "labelled" when it carries the FlatpackCNC/Selected attribute.
-# Selecting a face in the dialog labels it; unselecting removes the label.
-# The selected faces are shown with Fusion's own blue selection highlight.
-tracked = {}          # entityToken -> face currently selected in the dialog
-suppress = [False]    # True while the script itself changes the selection / dialog is closing
-HL_PREFIX = 'FlatpackHL_'   # tag of overlays made by earlier versions (cleaned up on open)
+# ---------------------------------------------------------------- part list
+# Each entry: {'uid', 'token' (entity token of the face or body picked), 'body' (token of
+# the body), 'kind' ('body' | 'face'), 'name' (body name), 'copies'}
+items = []
+uid_counter = [0]
 
 
-def is_labelled(face):
-    return face.attributes.itemByName(ATTR_GROUP, ATTR_NAME) is not None
-
-
-def set_label(face, on):
-    existing = face.attributes.itemByName(ATTR_GROUP, ATTR_NAME)
-    if on and not existing:
-        face.attributes.add(ATTR_GROUP, ATTR_NAME, '1')
-    elif not on and existing:
-        existing.deleteMe()
-
-
-def labelled_faces_all(root):
-    """Every labelled face (not just one per body)."""
-    out = []
-    for body in all_bodies(root):
-        if body.parentComponent.name == COMP_NAME:
-            continue
-        for face in body.faces:
-            if face.attributes.itemByName(ATTR_GROUP, ATTR_NAME):
-                out.append((body, face))
-    return out
-
-
-def _refresh_view():
+def _entity(token, cls):
     try:
-        app.activeViewport.refresh()
+        for ent in get_design().findEntityByToken(token):
+            e = cls.cast(ent)
+            if e:
+                return e
     except:
         pass
+    return None
 
 
-def clear_graphics():
-    """Delete leftover highlight overlays made by earlier versions of this add-in."""
-    try:
-        groups = get_design().rootComponent.customGraphicsGroups
-        for k in range(groups.count - 1, -1, -1):
-            g = groups.item(k)
-            if g.id.startswith(HL_PREFIX):
-                try:
-                    g.deleteMe()
-                except:
-                    pass
-    except:
-        pass
-    _refresh_view()
+def _entity_for_item(it):
+    if it['kind'] == 'face':
+        return _entity(it['token'], adsk.fusion.BRepFace)
+    return _entity(it['token'], adsk.fusion.BRepBody)
 
 
-ATTR_ORIG = 'OrigAppearance'     # written by older versions that painted faces directly
+def _new_uid():
+    uid_counter[0] += 1
+    return uid_counter[0]
 
 
-def remove_legacy_colours():
-    """Put back any face appearance an older version changed."""
+def persist_items():
+    """Remember the part list inside the design so it survives closing the dialog / file."""
     try:
         design = get_design()
-        for a in list(design.findAttributes(ATTR_GROUP, ATTR_ORIG)):
-            try:
-                face = adsk.fusion.BRepFace.cast(a.parent)
-                if face:
-                    orig = a.value
-                    face.appearance = design.appearances.itemByName(orig) if orig else None
-            except:
-                pass
-            a.deleteMe()
+        data = json.dumps([{k: it[k] for k in ('token', 'body', 'kind', 'name', 'copies')}
+                           for it in items])
+        a = design.attributes.itemByName(ATTR_GROUP, ATTR_ITEMS)
+        if a:
+            a.value = data
+        else:
+            design.attributes.add(ATTR_GROUP, ATTR_ITEMS, data)
     except:
         pass
 
 
-removed_tokens = set()   # labelled faces the user has unselected this session
-clear_all = [False]      # "Unset all" pressed: every existing label is to be removed
-_reported = [False]
+def load_items():
+    try:
+        a = get_design().attributes.itemByName(ATTR_GROUP, ATTR_ITEMS)
+        if not a:
+            return
+        for d in json.loads(a.value):
+            d['uid'] = _new_uid()
+            items.append(d)
+    except:
+        pass
 
 
-def _report_once():
-    if not _reported[0]:
-        _reported[0] = True
-        ui.messageBox('Selection handler error (shown once):\n' + traceback.format_exc())
+def validate_items():
+    """Drop entries whose face/body no longer exists, refresh names."""
+    for it in list(items):
+        e = _entity_for_item(it)
+        if e is None:
+            items.remove(it)
+        else:
+            body = e.body if it['kind'] == 'face' else e
+            it['name'] = body.name
 
 
-class LabelSelect(adsk.core.SelectionEventHandler):
-    """A selected face is marked immediately (tracked + coloured). The attribute itself is
-    written to the model when the dialog is closed or Build Layout is pressed, because
-    editing the model in the middle of a selection makes Fusion drop the selection."""
-    def notify(self, args):
-        try:
-            if suppress[0]:
-                return
-            f = adsk.fusion.BRepFace.cast(args.selection.entity)
-            if f:
-                tracked[f.entityToken] = f
-                removed_tokens.discard(f.entityToken)
-        except:
-            _report_once()
+def best_face(body):
+    """Largest planar face: the natural 'top' of a panel-like part."""
+    best, area = None, 0.0
+    for f in body.faces:
+        if f.geometry.surfaceType == adsk.core.SurfaceTypes.PlaneSurfaceType and f.area > area:
+            best, area = f, f.area
+    return best
 
 
-class LabelUnselect(adsk.core.SelectionEventHandler):
-    def notify(self, args):
-        try:
-            if suppress[0]:
-                return
-            f = adsk.fusion.BRepFace.cast(args.selection.entity)
-            if f:
-                tracked.pop(f.entityToken, None)
-                removed_tokens.add(f.entityToken)
-        except:
-            _report_once()
-
-
-def commit_labels(sel_tokens, removed, wipe):
-    """Write the dialog's selection into the model as face attributes."""
-    design = get_design()
-
-    def face_for(tok):
-        for ent in design.findEntityByToken(tok):
-            f = adsk.fusion.BRepFace.cast(ent)
-            if f:
-                return f
-        return None
-
-    if wipe:
-        for a in list(design.findAttributes(ATTR_GROUP, ATTR_NAME)):
-            a.deleteMe()
-    else:
-        for tok in removed:
-            f = face_for(tok)
-            if f:
-                set_label(f, False)
-    for tok in sel_tokens:
-        f = face_for(tok)
-        if f:
-            set_label(f, True)
+def resolve_items():
+    """[{'body', 'face' (None = free orientation), 'copies', 'name'}] for the build."""
+    jobs = []
+    for it in items:
+        e = _entity_for_item(it)
+        if e is None:
+            continue
+        if it['kind'] == 'face':
+            jobs.append({'body': e.body, 'face': e, 'copies': it['copies'], 'name': e.body.name})
+        else:
+            jobs.append({'body': e, 'face': None, 'copies': it['copies'], 'name': e.name})
+    return jobs
 
 
 # ---------------------------------------------------------------- step 2: build
@@ -878,20 +807,30 @@ def _build_flatpack(pd, gap, margin, max_width, max_depth, auto_orient, allow_ro
     um = design.unitsManager
     fmt = lambda v: um.formatInternalValue(v, um.defaultLengthUnits, True)
 
-    found = labelled_faces(root)
-    if not found:
-        pd.msg('No CNC top faces selected. Select faces under CNC Parts first.')
+    jobs = resolve_items()
+    if not jobs:
+        pd.msg('The part list is empty. Pick some bodies or faces first.')
         return
 
     tbm = adsk.fusion.TemporaryBRepManager.get()
     parts = []
 
-    # copy each body, point the labelled face up (+Z), opposite side on Z = 0,
-    # and turn it in-plane to its tightest bounding rectangle
-    nfound = len(found)
-    for n, (body, face) in enumerate(found.values()):
-        pd.set(2 + 28.0 * n / nfound, 'Reading part %d of %d: %s' % (n + 1, nfound, body.name))
-        origin, x, y, z = face_frame(face, True)
+    # copy each body (once per requested copy), point its top face up (+Z), put the
+    # opposite side on Z = 0 and turn it in-plane to its tightest bounding rectangle.
+    # A picked face is the top face. A picked body uses its largest flat face as the top,
+    # so it can lie any way up in the model.
+    for n, job in enumerate(jobs):
+        body, face = job['body'], job['face']
+        pd.set(2 + 28.0 * n / len(jobs), 'Reading part %d of %d: %s' % (n + 1, len(jobs), body.name))
+        if face is None:
+            face = best_face(body)
+        if face is not None:
+            origin, x, y, z = face_frame(face, True)
+        else:
+            origin = body.boundingBox.minPoint
+            x = adsk.core.Vector3D.create(1, 0, 0)
+            y = adsk.core.Vector3D.create(0, 1, 0)
+            z = adsk.core.Vector3D.create(0, 0, 1)
         if auto_orient:
             pts = _body_points_2d(body, origin, x, y)
             if pts:
@@ -902,7 +841,6 @@ def _build_flatpack(pd, gap, margin, max_width, max_depth, auto_orient, allow_ro
                 ny = z.crossProduct(nx)
                 ny.normalize()
                 x, y = nx, ny
-        tmp = tbm.copy(body)
         m = adsk.core.Matrix3D.create()
         m.setToAlignCoordinateSystems(
             origin, x, y, z,
@@ -910,14 +848,19 @@ def _build_flatpack(pd, gap, margin, max_width, max_depth, auto_orient, allow_ro
             adsk.core.Vector3D.create(1, 0, 0),
             adsk.core.Vector3D.create(0, 1, 0),
             adsk.core.Vector3D.create(0, 0, 1))
-        tbm.transform(tmp, m)
-        bb = tmp.boundingBox
-        mnx, mny = bb.minPoint.x, bb.minPoint.y
-        tbm.transform(tmp, translation(-bb.minPoint.x, -bb.minPoint.y, -bb.minPoint.z))
-        bb = tmp.boundingBox
-        mesh = _body_mesh_2d(body, origin, x, y, mnx, mny) if auto_orient else None
-        parts.append({'name': body.name, 'tmp': tmp, 'mesh': mesh, 'parent': None,
-                      'children': [], 'w': bb.maxPoint.x, 'h': bb.maxPoint.y})
+        mesh = None
+        for cn in range(max(1, job['copies'])):
+            tmp = tbm.copy(body)
+            tbm.transform(tmp, m)
+            bb = tmp.boundingBox
+            mnx, mny = bb.minPoint.x, bb.minPoint.y
+            tbm.transform(tmp, translation(-bb.minPoint.x, -bb.minPoint.y, -bb.minPoint.z))
+            bb = tmp.boundingBox
+            if cn == 0 and auto_orient:
+                mesh = _body_mesh_2d(body, origin, x, y, mnx, mny)
+            nm = job['name'] + ('_%d' % (cn + 1) if job['copies'] > 1 else '')
+            parts.append({'name': nm, 'tmp': tmp, 'mesh': mesh, 'parent': None,
+                          'children': [], 'w': bb.maxPoint.x, 'h': bb.maxPoint.y})
 
     # usable area inside the edge margin
     uw, uh = max_width - 2 * margin, max_depth - 2 * margin
@@ -1073,25 +1016,25 @@ class BuildExecute(adsk.core.CommandEventHandler):
                            i.itemById('margin').value,
                            i.itemById('width').value,
                            i.itemById('depth').value,
-                           i.itemById('align').value,
+                           True,
                            True,                      # 90 degree rotation always allowed
-                           i.itemById('multi').value)
+                           True)
         except:
             ui.messageBox('Flatpack failed:\n' + traceback.format_exc())
 
 
 # ---------------------------------------------------------------- single dialog
-ACTIONS = ['CNC Parts', 'Build Layout']
+ACTIONS = ['Build Layout']
 GROUP_ID = {name: 'grp%d' % k for k, name in enumerate(ACTIONS)}
 current_cmd = [None]
 reopen = [False]
 EVENT_ID = 'FlatpackReopenEvent'
 SYNC_ID = 'FlatpackSyncEvent'
 BUILD_ID = 'FlatpackBuildEvent'
+TABLE_ID = 'partTable'
 pending_build = [None]
-sync_state = {'sel': [], 'removed': [], 'wipe': False}
-settings = {'gap': 1.0, 'margin': 1.0, 'width': 120.0, 'depth': 240.0, 'align': True,
-            'multi': True}
+busy = [False]
+settings = {'gap': 1.0, 'margin': 1.0, 'width': 120.0, 'depth': 240.0}
 
 
 class _Finder:
@@ -1112,45 +1055,119 @@ class _Finder:
         return None
 
 
-class _Cmd:
-    def __init__(self, inputs):
-        self.commandInputs = _Finder(inputs)
+def _type_text(it):
+    return 'Face (top)' if it['kind'] == 'face' else 'Body'
 
 
-class _Args:
-    def __init__(self, inputs):
-        self.command = _Cmd(inputs)
+def add_row(inputs, table, it):
+    """Add one row: Name | Body/Face | Copies (editable)."""
+    row = table.rowCount
+    uid = it['uid']
+    nm = inputs.addStringValueInput('nm_%d' % uid, 'Name', it['name'])
+    nm.isReadOnly = True
+    ty = inputs.addStringValueInput('ty_%d' % uid, 'Type', _type_text(it))
+    ty.isReadOnly = True
+    cp = inputs.addIntegerSpinnerCommandInput('cp_%d' % uid, 'Copies', 1, 999, 1, it['copies'])
+    xx = inputs.addStringValueInput('xx_%d' % uid, 'x', 'x')
+    xx.isReadOnly = True
+    dl = inputs.addBoolValueInput('dl_%d' % uid, '\u2715', False, '', False)
+    table.addCommandInput(dl, row, 0)
+    table.addCommandInput(nm, row, 1)
+    table.addCommandInput(ty, row, 2)
+    table.addCommandInput(xx, row, 3)
+    table.addCommandInput(cp, row, 4)
+
+
+def add_pick(inputs, table, ent, kind):
+    """Add a picked body/face to the list. Several faces of one body are allowed; a body
+    and a face of the same body are not (the newest pick wins)."""
+    body = ent.body if kind == 'face' else ent
+    if body.parentComponent.name == COMP_NAME:
+        return
+    btok = body.entityToken
+    for it in items:
+        if it['kind'] == kind and it['token'] == ent.entityToken:
+            return
+    for row in range(len(items) - 1, -1, -1):
+        if items[row]['body'] == btok and items[row]['kind'] != kind:
+            table.deleteRow(row)
+            items.pop(row)
+    it = {'uid': _new_uid(), 'token': ent.entityToken, 'body': btok,
+          'kind': kind, 'name': body.name, 'copies': 1}
+    items.append(it)
+    add_row(inputs, table, it)
+
+
+def sync_sel(sel, kind):
+    """Make a selection input hold exactly the entities of that kind in the list."""
+    want = []
+    for it in items:
+        if it['kind'] == kind:
+            e = _entity_for_item(it)
+            if e is not None:
+                want.append(e)
+    have = set(sel.selection(k).entity.entityToken for k in range(sel.selectionCount))
+    if have == set(e.entityToken for e in want):
+        return
+    sel.clearSelection()
+    for e in want:
+        try:
+            sel.addSelection(e)
+        except:
+            pass
 
 
 class MainChanged(adsk.core.InputChangedEventHandler):
     def notify(self, args):
+        if busy[0]:
+            return
+        busy[0] = True
         try:
             iid = args.input.id
-            if iid == 'faces':
-                if not suppress[0]:
-                    sel = adsk.core.SelectionCommandInput.cast(args.input)
-                    now = {}
-                    for k in range(sel.selectionCount):
-                        f = adsk.fusion.BRepFace.cast(sel.selection(k).entity)
-                        if f:
-                            now[f.entityToken] = f
-                    for tok in list(tracked):
-                        if tok not in now:
-                            removed_tokens.add(tok)
-                    for tok in now:
-                        removed_tokens.discard(tok)
-                    tracked.clear()
-                    tracked.update(now)
+            inputs = args.inputs
+            table = adsk.core.TableCommandInput.cast(inputs.itemById(TABLE_ID))
+            if iid in ('bodySel', 'faceSel'):
+                kind = 'body' if iid == 'bodySel' else 'face'
+                sel = adsk.core.SelectionCommandInput.cast(args.input)
+                cls = adsk.fusion.BRepBody if kind == 'body' else adsk.fusion.BRepFace
+                cur = [cls.cast(sel.selection(k).entity) for k in range(sel.selectionCount)]
+                cur = [e for e in cur if e]
+                tokens = set(e.entityToken for e in cur)
+                # anything of this kind no longer selected (or cleared with the x) is removed
+                for row in range(len(items) - 1, -1, -1):
+                    if items[row]['kind'] == kind and items[row]['token'] not in tokens:
+                        table.deleteRow(row)
+                        items.pop(row)
+                for ent in cur:
+                    add_pick(inputs, table, ent, kind)
+                # keep both pickers in step with the list (a body picked as a face, etc.)
+                sync_sel(adsk.core.SelectionCommandInput.cast(inputs.itemById('bodySel')), 'body')
+                sync_sel(adsk.core.SelectionCommandInput.cast(inputs.itemById('faceSel')), 'face')
+            elif iid.startswith('dl_'):
+                uid = int(iid[3:])
+                for row, it in enumerate(items):
+                    if it['uid'] == uid:
+                        table.deleteRow(row)
+                        items.pop(row)
+                        break
+                sync_sel(adsk.core.SelectionCommandInput.cast(inputs.itemById('bodySel')), 'body')
+                sync_sel(adsk.core.SelectionCommandInput.cast(inputs.itemById('faceSel')), 'face')
+            elif iid.startswith('cp_'):
+                uid = int(iid[3:])
+                sp = adsk.core.IntegerSpinnerCommandInput.cast(args.input)
+                for it in items:
+                    if it['uid'] == uid:
+                        it['copies'] = max(1, sp.value)
         except:
-            suppress[0] = False
             ui.messageBox('Failed:\n' + traceback.format_exc())
+        finally:
+            busy[0] = False
 
 
 def save_settings(finder):
     try:
         g = lambda k: finder.itemById(k).value
-        settings.update(gap=g('gap'), margin=g('margin'), multi=g('multi'), width=g('width'),
-                        depth=g('depth'), align=g('align'))
+        settings.update(gap=g('gap'), margin=g('margin'), width=g('width'), depth=g('depth'))
     except:
         pass
 
@@ -1159,15 +1176,14 @@ class MainExecute(adsk.core.CommandEventHandler):
     """The OK button is 'Build Layout'."""
     def notify(self, args):
         try:
-            suppress[0] = True               # ignore selection events caused by closing
-            fake = _Args(args.command.commandInputs)
-            save_settings(fake.command.commandInputs)
-            commit_labels(list(tracked.keys()), list(removed_tokens), clear_all[0])
+            finder = _Finder(args.command.commandInputs)
+            save_settings(finder)
             reopen[0] = True                 # dialog reopens after the build has run
-            g = lambda k: fake.command.commandInputs.itemById(k).value
+            g = lambda k: finder.itemById(k).value
             # the build itself runs from a custom event, once this dialog has closed
-            pending_build[0] = (g('gap'), g('margin'), g('width'), g('depth'), g('align'),
-                                True, g('multi'))
+            # Auto Fit and multiple sheets are always on
+            pending_build[0] = (g('gap'), g('margin'), g('width'), g('depth'),
+                                True, True, True)
         except:
             ui.messageBox('Failed:\n' + traceback.format_exc())
 
@@ -1175,19 +1191,10 @@ class MainExecute(adsk.core.CommandEventHandler):
 class MainDestroy(adsk.core.CommandEventHandler):
     def notify(self, args):
         try:
-            suppress[0] = True
-            clear_graphics()
             if reopen[0]:
                 reopen[0] = False
-                tracked.clear()
                 app.fireCustomEvent(BUILD_ID if pending_build[0] else EVENT_ID)
             else:
-                # dialog closed without Build Layout: Fusion may roll the label changes back,
-                # so re-apply the selection as labels once the command has finished
-                sync_state['sel'] = list(tracked.keys())
-                sync_state['removed'] = list(removed_tokens)
-                sync_state['wipe'] = clear_all[0]
-                tracked.clear()
                 app.fireCustomEvent(SYNC_ID)
         except:
             pass
@@ -1198,6 +1205,7 @@ class BuildHandler(adsk.core.CustomEventHandler):
     def notify(self, args):
         params, pending_build[0] = pending_build[0], None
         try:
+            persist_items()
             if params:
                 build_flatpack(*params)
         except:
@@ -1218,10 +1226,7 @@ class ReopenHandler(adsk.core.CustomEventHandler):
 
 class SyncHandler(adsk.core.CustomEventHandler):
     def notify(self, args):
-        try:
-            commit_labels(sync_state['sel'], sync_state['removed'], sync_state['wipe'])
-        except:
-            pass
+        persist_items()
 
 
 class MainCreated(adsk.core.CommandCreatedEventHandler):
@@ -1229,39 +1234,41 @@ class MainCreated(adsk.core.CommandCreatedEventHandler):
         try:
             cmd = args.command
             current_cmd[0] = cmd
-            tracked.clear()
-            removed_tokens.clear()
-            clear_all[0] = False
-            _reported[0] = False
-            suppress[0] = False
+            busy[0] = False
             top = cmd.commandInputs
-            groups = {}
-            for name in ACTIONS:
-                g = top.addGroupCommandInput(GROUP_ID[name], name)
-                g.isExpanded = True                  # both groups are always open
-                groups[name] = g.children
 
-            # CNC Parts
-            i = groups['CNC Parts']
-            sel = i.addSelectionInput('faces', 'Top Faces',
-                                      'Click faces to label them; click again to unselect')
-            sel.addSelectionFilter('PlanarFaces')
-            sel.setSelectionLimits(0, 0)
+            validate_items()
+            if not items:
+                load_items()
+                validate_items()
 
-            # pre-populate with faces that already carry the label
-            suppress[0] = True
+            # two pickers: bodies (any way up) or faces (the picked face is the top)
+            bsel = top.addSelectionInput('bodySel', 'Select Body',
+                                         'Pick a whole body - it may lie any way up')
+            bsel.addSelectionFilter('SolidBodies')
+            bsel.setSelectionLimits(0, 0)
+            fsel = top.addSelectionInput('faceSel', 'Select Face',
+                                         'Pick the face that must point UP (top face)')
+            fsel.addSelectionFilter('PlanarFaces')
+            fsel.setSelectionLimits(0, 0)
+
+            # part list
+            table = top.addTableCommandInput(TABLE_ID, 'Parts', 5, '2:12:8:2:5')
+            table.minimumVisibleRows = 3
+            table.maximumVisibleRows = 6          # more rows than this scroll
+            for it in items:
+                add_row(top, table, it)
+            busy[0] = True
             try:
-                for _, f in labelled_faces_all(get_design().rootComponent):
-                    try:
-                        sel.addSelection(f)
-                        tracked[f.entityToken] = f
-                    except:
-                        pass
+                sync_sel(bsel, 'body')
+                sync_sel(fsel, 'face')
             finally:
-                suppress[0] = False
+                busy[0] = False
 
             # Build Layout
-            i = groups['Build Layout']
+            g = top.addGroupCommandInput(GROUP_ID['Build Layout'], 'Build Layout')
+            g.isExpanded = True
+            i = g.children
             unit = get_design().unitsManager.defaultLengthUnits
             i.addValueInput('gap', 'Gap between parts', unit,
                             adsk.core.ValueInput.createByReal(settings['gap']))
@@ -1271,20 +1278,15 @@ class MainCreated(adsk.core.CommandCreatedEventHandler):
                             adsk.core.ValueInput.createByReal(settings['width']))
             i.addValueInput('depth', 'Sheet depth (Y)', unit,
                             adsk.core.ValueInput.createByReal(settings['depth']))
-            i.addBoolValueInput('align', 'Auto Fit', True, '', settings['align'])
-            i.addBoolValueInput('multi', 'Allow multiple sheets', True, '', settings['multi'])
 
             cmd.okButtonText = 'Build Layout'
             cmd.cancelButtonText = 'Close'
 
-            for ev, cls in ((cmd.select, LabelSelect), (cmd.unselect, LabelUnselect),
-                            (cmd.inputChanged, MainChanged), (cmd.execute, MainExecute),
+            for ev, cls in ((cmd.inputChanged, MainChanged), (cmd.execute, MainExecute),
                             (cmd.destroy, MainDestroy)):
                 h = cls()
                 ev.add(h)
                 handlers.append(h)
-            remove_legacy_colours()
-            clear_graphics()
         except:
             ui.messageBox('Failed:\n' + traceback.format_exc())
 
